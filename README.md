@@ -4,6 +4,8 @@ Move a Claude Code terminal session from one Mac to another. Export on one machi
 
 > **Warning: a bundle contains your whole conversation.** Transcripts can hold secrets (tokens, `.env` contents that were printed) and private code. The bundle is a plain, unencrypted `.tar.gz`. Move it yourself (AirDrop, USB stick, synced folder), never post it anywhere, and delete it when you are done. This tool uploads nothing and makes no network calls.
 
+Current version: **0.1.0** (see [CHANGELOG.md](CHANGELOG.md)). `claude-session-move --version` prints it.
+
 ## Install
 
 One Python 3.9+ file, standard library only. Copy it onto your PATH:

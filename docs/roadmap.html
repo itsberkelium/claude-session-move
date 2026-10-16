@@ -82,7 +82,7 @@ code, .mono { font-family: var(--font-mono); font-size: 0.9em; }
       <div class="bar" id="bar" role="img" aria-label="Overall progress"></div>
       <div class="counts" id="counts"></div>
     </div>
-    <div class="stamp">Updated 2026-10-16 · built and pushed; real two-Mac test pending</div>
+    <div class="stamp">Updated 2026-10-16 · v0.1.0 released; v0.2.0 (GUI) next</div>
   </div>
 
   <div class="main">
@@ -166,10 +166,11 @@ var PHASES = [
     ["install: copy the script to ~/.local/bin and print the PATH line", true],
     ["cleanup: delete an imported session, optionally its backups, after confirmation", true],
     ["Real claude --resume of an imported copy worked (hand-tested)", true],
+    ["Tag and publish the v0.1.0 GitHub release", true],
     ["Test export and import between your two Macs", false]
   ]},
   { name: "10 · Later", later: true, goal: "Out of scope for now.", tasks: [
-    ["GUI wrapper over the core functions", false],
+    ["v0.2.0: GUI wrapper over the core functions (TOOL_VERSION stays 0.1.0 until it is done)", false],
     ["Optional encryption of the bundle", false]
   ]}
 ];

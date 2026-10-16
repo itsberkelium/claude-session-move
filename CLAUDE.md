@@ -2,7 +2,7 @@
 
 ### Issue tracker
 
-Issues live in GitHub Issues for `itsberkelium/ai-session-mover` (via the `gh` CLI). See `docs/agents/issue-tracker.md`.
+Issues live in GitHub Issues for `itsberkelium/claude-session-move` (via the `gh` CLI). See `docs/agents/issue-tracker.md`.
 
 ### Triage labels
 

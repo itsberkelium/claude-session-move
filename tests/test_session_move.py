@@ -405,6 +405,12 @@ class CleanupTests(Base):
             csm.plan_cleanup(self.cfg, self.root, "../x")
 
 
+class VersionTests(unittest.TestCase):
+    def test_changelog_lists_current_version(self):
+        with open(os.path.join(HERE, "..", "CHANGELOG.md")) as fh:
+            self.assertIn("## %s - " % csm.TOOL_VERSION, fh.read())
+
+
 class InstallTests(Base):
     def test_install_copies_executable_and_hints_path(self):
         prefix = os.path.join(self.root, "bin")
