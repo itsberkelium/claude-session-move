@@ -45,7 +45,8 @@ Run `claude-session-move export` with no session in a terminal to pick from a li
 - On import only the `cwd` field is rewritten to the new path. Message text and tool output are history and stay as they are.
 - An existing session id is never overwritten without `--force`; the old files are copied to `<config>/session-move-backups/<time>/` first.
 - Paths over 200 characters or with non-ASCII characters cannot be mapped reliably. Use `--project-folder NAME`.
-- Resume is checked by file (`doctor`), not by running Claude, so nothing calls the API.
+- The target directory is resolved with `realpath` (on macOS `/tmp` is `/private/tmp`); Claude Code looks sessions up under the resolved path.
+- `doctor` checks by file and never runs Claude, so nothing calls the API. A real `claude --resume` of an imported session was tested by hand and worked.
 
 ## Tests
 
