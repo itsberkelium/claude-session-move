@@ -82,7 +82,7 @@ code, .mono { font-family: var(--font-mono); font-size: 0.9em; }
       <div class="bar" id="bar" role="img" aria-label="Overall progress"></div>
       <div class="counts" id="counts"></div>
     </div>
-    <div class="stamp">Updated 2026-10-16 · built, awaiting review</div>
+    <div class="stamp">Updated 2026-10-16 · built and pushed; real two-Mac test pending</div>
   </div>
 
   <div class="main">
@@ -162,15 +162,21 @@ var PHASES = [
     ["Round trip: export the squad-creator example, import into /tmp/restore-test/some-repo", true],
     ["Show test output and the doctor result. Resume is file-verified, not run", true]
   ]},
-  { name: "9 · Later", later: true, goal: "Out of scope for now.", tasks: [
+  { name: "9 · Extras", goal: "Housekeeping commands added after the first round trip.", tasks: [
+    ["install: copy the script to ~/.local/bin and print the PATH line", true],
+    ["cleanup: delete an imported session, optionally its backups, after confirmation", true],
+    ["Real claude --resume of an imported copy worked (hand-tested)", true],
+    ["Test export and import between your two Macs", false]
+  ]},
+  { name: "10 · Later", later: true, goal: "Out of scope for now.", tasks: [
     ["GUI wrapper over the core functions", false],
     ["Optional encryption of the bundle", false]
   ]}
 ];
 var WAITING = [
-  "Review the code and the round-trip output.",
+  "Run the real two-Mac export and import.",
   
-  "Run the printed claude --resume on a real second Mac; resume is file-verified only."
+  "Tell me anything odd you see, and I will fix it."
 ];
 var DECISIONS = [
   "CLI first, GUI later; core is plain functions",
@@ -179,7 +185,7 @@ var DECISIONS = [
   "Sidecar folder included; memory only with --memory",
   "Rewrite cwd only",
   "No redaction, no encryption; README warns",
-  "No API calls; resume is file-verified",
+  "No API calls; doctor checks by file. Real resume confirmed by hand",
   "Not bundled: tasks, file-history, history, session-env",
   "Backups outside projects/, files 0600",
   "Target directory must exist; realpath is used",
