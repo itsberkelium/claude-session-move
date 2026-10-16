@@ -1,0 +1,695 @@
+#!/usr/bin/env python3
+"""claude-session-move: move a Claude Code session between Macs as a single bundle file.
+
+Standard library only, Python 3.9+. No network. See README.md.
+"""
+from __future__ import annotations
+
+import argparse
+import datetime
+import hashlib
+import io
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tarfile
+import tempfile
+import time
+
+TOOL_VERSION = "0.1.0"
+SCHEMA_VERSION = 1
+MAX_FOLDER_LEN = 200
+ACTIVE_WINDOW_SECONDS = 60
+SESSION_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+BUNDLE_SUFFIX = ".claude-session.tar.gz"
+
+HANDOFF_PROMPT = """\
+I am about to move this session to another computer. Before I do, please write down what a new
+machine would not know. Reply with one block I can copy:
+
+1. Your open task list: every task, its status, and what is left to do.
+2. The next 3 concrete steps you were about to take.
+3. Any decision, assumption or half-finished change that is not yet in the repository.
+4. The exact commands to run first on the new machine (for example git pull, install, start a server).
+
+Keep it short and specific. Do not change any files."""
+
+
+class ToolError(Exception):
+    """A problem the user can fix. Printed without a traceback; exit code 2."""
+
+
+# --------------------------------------------------------------------------- core: paths
+
+
+def config_dir(env=None) -> str:
+    env = os.environ if env is None else env
+    return os.path.abspath(os.path.expanduser(env.get("CLAUDE_CONFIG_DIR") or "~/.claude"))
+
+
+def encode_project_path(path: str) -> str:
+    """Claude Code's rule: every non-alphanumeric character becomes '-'.
+
+    Over 200 characters Claude Code truncates and appends a hash we cannot reproduce, and
+    non-ASCII handling is undocumented, so both cases raise instead of guessing.
+    """
+    if not path.isascii():
+        raise ToolError(
+            "The path contains non-ASCII characters, so the project folder name cannot be derived "
+            "reliably. Pass --project-folder NAME with the exact folder name under projects/."
+        )
+    name = re.sub(r"[^A-Za-z0-9]", "-", path)
+    if len(name) > MAX_FOLDER_LEN:
+        raise ToolError(
+            "The path is longer than %d characters, so Claude Code adds a hash to the folder name "
+            "that this tool cannot reproduce. Pass --project-folder NAME." % MAX_FOLDER_LEN
+        )
+    return name
+
+
+def resolve_folder(cfg: str, directory: str, project_folder=None) -> str:
+    return project_folder or encode_project_path(os.path.realpath(directory))
+
+
+def check_session_id(session_id: str) -> str:
+    if not SESSION_ID_RE.match(session_id or ""):
+        raise ToolError("Invalid session id: %r" % (session_id,))
+    return session_id
+
+
+# ---------------------------------------------------------------------- core: transcripts
+
+
+def read_lines(path: str):
+    """Yield (line_number, raw_text, parsed_or_None) for each non-empty line."""
+    with open(path, "r", encoding="utf-8", newline="") as fh:
+        for number, raw in enumerate(fh, 1):
+            text = raw.rstrip("\r\n")
+            if not text.strip():
+                continue
+            try:
+                yield number, text, json.loads(text)
+            except ValueError:
+                yield number, text, None
+
+
+def _message_text(message) -> str:
+    content = message.get("content") if isinstance(message, dict) else None
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "text":
+                return block.get("text") or ""
+    return ""
+
+
+def session_title(path: str, limit: int = 80) -> str:
+    ai_title = ""
+    try:
+        for _, _, obj in read_lines(path):
+            if not isinstance(obj, dict):
+                continue
+            if obj.get("type") == "ai-title" and obj.get("aiTitle"):
+                ai_title = obj["aiTitle"]
+            if obj.get("type") != "user" or obj.get("isMeta") or obj.get("isSidechain"):
+                continue
+            text = _message_text(obj.get("message")).strip()
+            if text and not text.startswith("<"):
+                return _shorten(text, limit)
+    except OSError:
+        pass
+    return _shorten(ai_title, limit) if ai_title else "(no title)"
+
+
+def _shorten(text: str, limit: int) -> str:
+    text = " ".join(text.split())
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+def transcript_facts(path: str) -> dict:
+    """First cwd, last Claude Code version and last git branch recorded in a transcript."""
+    facts = {"cwd": None, "claude_version": None, "git_branch": None, "session_ids": set()}
+    for _, _, obj in read_lines(path):
+        if not isinstance(obj, dict):
+            continue
+        if facts["cwd"] is None and isinstance(obj.get("cwd"), str):
+            facts["cwd"] = obj["cwd"]
+        if isinstance(obj.get("version"), str):
+            facts["claude_version"] = obj["version"]
+        if isinstance(obj.get("gitBranch"), str):
+            facts["git_branch"] = obj["gitBranch"]
+        if isinstance(obj.get("sessionId"), str):
+            facts["session_ids"].add(obj["sessionId"])
+    return facts
+
+
+def rewrite_cwd(path_in: str, old: str, new: str):
+    """Return (lines, rewritten_count). Only a top-level cwd under `old` is changed.
+
+    Lines that need no change keep their exact bytes. Raises ToolError on invalid JSON.
+    """
+    out, count = [], 0
+    for number, text, obj in read_lines(path_in):
+        if obj is None:
+            raise ToolError("Transcript line %d is not valid JSON." % number)
+        cwd = obj.get("cwd") if isinstance(obj, dict) else None
+        if isinstance(cwd, str) and old != new and (cwd == old or cwd.startswith(old.rstrip("/") + "/")):
+            obj["cwd"] = new.rstrip("/") + cwd[len(old.rstrip("/")):]
+            text = json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
+            count += 1
+        out.append(text)
+    return out, count
+
+
+# ------------------------------------------------------------------------ core: sessions
+
+
+def list_sessions(cfg: str, folder: str):
+    base = os.path.join(cfg, "projects", folder)
+    rows = []
+    if not os.path.isdir(base):
+        return rows
+    for name in os.listdir(base):
+        full = os.path.join(base, name)
+        if name.endswith(".jsonl") and os.path.isfile(full):
+            st = os.stat(full)
+            rows.append({"id": name[:-6], "path": full, "mtime": st.st_mtime, "size": st.st_size,
+                         "title": session_title(full)})
+    rows.sort(key=lambda r: r["mtime"], reverse=True)
+    return rows
+
+
+def human_size(n: int) -> str:
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024 or unit == "GB":
+            return "%d %s" % (n, unit) if unit == "B" else "%.1f %s" % (n, unit)
+        n /= 1024.0
+
+
+def format_time(ts: float) -> str:
+    return datetime.datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M")
+
+
+def pick_session(rows, choice, stdin=None, stdout=None):
+    if not rows:
+        raise ToolError("No sessions found for this directory.")
+    if choice == "latest":
+        return rows[0]["id"]
+    if choice:
+        check_session_id(choice)
+        if not any(r["id"] == choice for r in rows):
+            raise ToolError("Session %s not found for this directory." % choice)
+        return choice
+    stdin = stdin or sys.stdin
+    stdout = stdout or sys.stdout
+    if not (stdin.isatty() and stdout.isatty()):
+        raise ToolError("No session given and no terminal to ask on. Pass a session id or 'latest'.")
+    print_session_table(rows, stdout)
+    answer = input("Pick a number: ").strip()
+    if not answer.isdigit() or not 1 <= int(answer) <= len(rows):
+        raise ToolError("Not a valid choice: %r" % answer)
+    return rows[int(answer) - 1]["id"]
+
+
+def print_session_table(rows, out):
+    for i, r in enumerate(rows, 1):
+        print("%3d  %s  %-36s  %9s  %s" % (i, format_time(r["mtime"]), r["id"], human_size(r["size"]), r["title"]),
+              file=out)
+
+
+# --------------------------------------------------------------------------- core: bundle
+
+
+def sha256_bytes(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def sha256_file(path: str) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _walk_regular(root: str):
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+        dirnames.sort()
+        for name in sorted(filenames):
+            full = os.path.join(dirpath, name)
+            if os.path.isfile(full) and not os.path.islink(full):
+                yield full, os.path.relpath(full, root).replace(os.sep, "/")
+
+
+def collect_export_files(cfg, folder, session_id, memory, sidecar):
+    base = os.path.join(cfg, "projects", folder)
+    transcript = os.path.join(base, session_id + ".jsonl")
+    if not os.path.isfile(transcript):
+        raise ToolError("Transcript not found: %s" % transcript)
+    files = [(transcript, "transcript/%s.jsonl" % session_id)]
+    if sidecar:
+        side = os.path.join(base, session_id)
+        if os.path.isdir(side):
+            files += [(full, "sidecar/%s/%s" % (session_id, rel)) for full, rel in _walk_regular(side)]
+    if memory:
+        mem = os.path.join(base, "memory")
+        if os.path.isdir(mem):
+            files += [(full, "memory/" + rel) for full, rel in _walk_regular(mem)]
+    return files
+
+
+def build_manifest(session_id, project_path, facts, files):
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "tool": "claude-session-move",
+        "tool_version": TOOL_VERSION,
+        "claude_code_version": facts["claude_version"],
+        "created_at": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "session_id": session_id,
+        "project_path": project_path,
+        "git_branch": facts["git_branch"],
+        "files": [{"path": arc, "size": os.path.getsize(src), "sha256": sha256_file(src)} for src, arc in files],
+    }
+
+
+def export_session(cfg, directory, session_id, out=None, memory=False, sidecar=True, dry_run=False,
+                   project_folder=None, force=False, log=print):
+    """Create a bundle. Returns the manifest. With dry_run nothing is written."""
+    check_session_id(session_id)
+    folder = resolve_folder(cfg, directory, project_folder)
+    files = collect_export_files(cfg, folder, session_id, memory, sidecar)
+    transcript = files[0][0]
+    facts = transcript_facts(transcript)
+    project_path = facts["cwd"] or os.path.realpath(directory)
+    out = os.path.abspath(out or "%s-%s%s" % (os.path.basename(os.path.realpath(directory)) or "root",
+                                              session_id[:8], BUNDLE_SUFFIX))
+    age = time.time() - os.stat(transcript).st_mtime
+    if age < ACTIVE_WINDOW_SECONDS:
+        log("warning: this transcript changed %d seconds ago. The session may still be running; "
+            "quit it first so the bundle is complete." % age)
+    log("read    %s" % os.path.join(cfg, "projects", folder))
+    for src, arc in files:
+        log("add     %s  (%s)" % (arc, human_size(os.path.getsize(src))))
+    log("write   %s" % out)
+    if dry_run:
+        log("dry run: nothing was written.")
+        return build_manifest(session_id, project_path, facts, files)
+    if os.path.exists(out) and not force:
+        raise ToolError("%s already exists. Use --force to replace it." % out)
+    manifest = build_manifest(session_id, project_path, facts, files)
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(out), prefix=".csm-", suffix=".tmp")
+    os.close(fd)
+    try:
+        with tarfile.open(tmp, "w:gz") as tar:
+            data = json.dumps(manifest, indent=2).encode("utf-8")
+            info = tarfile.TarInfo("manifest.json")
+            info.size, info.mode, info.mtime = len(data), 0o600, int(time.time())
+            tar.addfile(info, io.BytesIO(data))
+            for src, arc in files:
+                info = tar.gettarinfo(src, arcname=arc)
+                info.uid = info.gid = 0
+                info.uname = info.gname = ""
+                info.mode = 0o600
+                with open(src, "rb") as fh:
+                    tar.addfile(info, fh)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, out)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+    log("")
+    log("Done. The bundle holds the full conversation, including any secrets and private code that "
+        "appeared in it. Move it only over channels you trust and delete it when finished.")
+    log("Open task lists are NOT included. Run `claude-session-move handoff-prompt` and paste the "
+        "result into the session before exporting if you need them.")
+    log("The code is not moved either: push your repo and pull it on the other Mac.")
+    return manifest
+
+
+def open_bundle(path):
+    """Return (manifest, {name: bytes-reader-info}) after validating names and checksums.
+
+    Returns a dict of member name -> bytes for every regular file. Raises ToolError on any problem.
+    """
+    if not os.path.isfile(path):
+        raise ToolError("Bundle not found: %s" % path)
+    members = {}
+    try:
+        with tarfile.open(path, "r:gz") as tar:
+            for m in tar.getmembers():
+                name = m.name
+                if m.isdir():
+                    continue
+                if not m.isreg():
+                    raise ToolError("Bundle contains a non-regular entry: %r" % name)
+                if name.startswith("/") or ".." in name.split("/") or "\\" in name:
+                    raise ToolError("Bundle contains an unsafe path: %r" % name)
+                members[name] = tar.extractfile(m).read()
+    except (tarfile.TarError, EOFError, OSError) as exc:
+        raise ToolError("Not a readable bundle (%s)." % exc)
+    if "manifest.json" not in members:
+        raise ToolError("Bundle has no manifest.json.")
+    try:
+        manifest = json.loads(members["manifest.json"].decode("utf-8"))
+    except ValueError:
+        raise ToolError("manifest.json is not valid JSON.")
+    return manifest, members
+
+
+def verify_bundle_data(manifest, members):
+    """Return a list of problem strings (empty means fine)."""
+    problems = []
+    if manifest.get("schema_version") != SCHEMA_VERSION:
+        problems.append("Unsupported schema_version %r (this tool reads %d)." %
+                        (manifest.get("schema_version"), SCHEMA_VERSION))
+    sid = manifest.get("session_id")
+    if not isinstance(sid, str) or not SESSION_ID_RE.match(sid):
+        problems.append("Manifest has no valid session_id.")
+        return problems
+    if not isinstance(manifest.get("project_path"), str) or not manifest["project_path"].startswith("/"):
+        problems.append("Manifest project_path is missing or not absolute.")
+    listed = {}
+    for entry in manifest.get("files") or []:
+        listed[entry.get("path")] = entry
+    for name, entry in listed.items():
+        if name not in members:
+            problems.append("Listed file is missing from the bundle: %s" % name)
+        elif sha256_bytes(members[name]) != entry.get("sha256"):
+            problems.append("Checksum mismatch (corrupt or edited): %s" % name)
+    for name in members:
+        if name != "manifest.json" and name not in listed:
+            problems.append("File is not listed in the manifest: %s" % name)
+    tname = "transcript/%s.jsonl" % sid
+    if tname not in members:
+        problems.append("Transcript %s is missing." % tname)
+    else:
+        problems += check_jsonl(members[tname].decode("utf-8", "replace"), sid)
+    return problems
+
+
+def check_jsonl(text, session_id):
+    problems, seen = [], False
+    for number, line in enumerate(text.splitlines(), 1):
+        if not line.strip():
+            continue
+        try:
+            obj = json.loads(line)
+        except ValueError:
+            problems.append("Transcript line %d is not valid JSON." % number)
+            if len(problems) >= 5:
+                problems.append("(more invalid lines not shown)")
+                break
+            continue
+        if isinstance(obj, dict) and obj.get("sessionId") == session_id:
+            seen = True
+    if not seen:
+        problems.append("Session id %s does not appear in any transcript line." % session_id)
+    return problems
+
+
+# --------------------------------------------------------------------------- core: import
+
+
+def parse_version(text):
+    nums = re.findall(r"\d+", text or "")
+    return tuple(int(n) for n in nums[:3]) if nums else None
+
+
+def installed_claude_version(env=None):
+    env = os.environ if env is None else env
+    if "CLAUDE_SESSION_MOVE_CLAUDE_VERSION" in env:
+        return env["CLAUDE_SESSION_MOVE_CLAUDE_VERSION"] or None
+    try:
+        res = subprocess.run(["claude", "--version"], capture_output=True, text=True, timeout=5)
+        return res.stdout.strip() or None
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def _write_private(path, data: bytes):
+    os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "wb") as fh:
+        fh.write(data)
+
+
+def _backup(src, backup_root, cfg, log, dry_run):
+    rel = os.path.relpath(src, cfg)
+    dest = os.path.join(backup_root, rel)
+    log("backup  %s -> %s" % (src, dest))
+    if dry_run:
+        return
+    os.makedirs(os.path.dirname(dest), mode=0o700, exist_ok=True)
+    if os.path.isdir(src):
+        shutil.copytree(src, dest)
+    else:
+        shutil.copy2(src, dest)
+
+
+def import_bundle(cfg, bundle, directory, force=False, dry_run=False, project_folder=None,
+                  log=print, claude_version=None):
+    """Install a bundle. Returns {'session_id', 'folder', 'target'}."""
+    manifest, members = open_bundle(bundle)
+    problems = verify_bundle_data(manifest, members)
+    if problems:
+        raise ToolError("Bundle failed verification:\n  " + "\n  ".join(problems))
+    sid = manifest["session_id"]
+    target = os.path.realpath(directory)
+    if not os.path.isdir(target):
+        raise ToolError("Target directory does not exist: %s\nClone or create it first." % directory)
+    folder = resolve_folder(cfg, target, project_folder)
+    base = os.path.join(cfg, "projects", folder)
+    dest_transcript = os.path.join(base, sid + ".jsonl")
+    dest_side = os.path.join(base, sid)
+    exists = os.path.exists(dest_transcript) or os.path.exists(dest_side)
+    if exists and not force:
+        raise ToolError("Session %s already exists in %s.\nUse --force to replace it (a backup is made first)."
+                        % (sid, base))
+    old = manifest["project_path"]
+    tmp_src = tempfile.NamedTemporaryFile(delete=False, suffix=".jsonl")
+    try:
+        tmp_src.write(members["transcript/%s.jsonl" % sid])
+        tmp_src.close()
+        lines, rewritten = rewrite_cwd(tmp_src.name, old, target)
+    finally:
+        os.unlink(tmp_src.name)
+    log("read    %s" % bundle)
+    log("target  %s  ->  %s" % (target, base))
+    log("rewrite %d line(s): cwd %s -> %s" % (rewritten, old, target) if old != target
+        else "rewrite none: the project path is unchanged")
+    backup_root = os.path.join(cfg, "session-move-backups",
+                               datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ"))
+    if exists:
+        for p in (dest_transcript, dest_side):
+            if os.path.exists(p):
+                _backup(p, backup_root, cfg, log, dry_run)
+    log("write   %s" % dest_transcript)
+    side_prefix = "sidecar/%s/" % sid
+    side_files = [n for n in members if n.startswith(side_prefix)]
+    mem_files = [n for n in members if n.startswith("memory/")]
+    for n in side_files:
+        log("write   %s" % os.path.join(base, sid, n[len(side_prefix):]))
+    skipped = []
+    for n in mem_files:
+        dest = os.path.join(base, n)
+        if os.path.exists(dest) and not force:
+            skipped.append(dest)
+            log("skip    %s (exists; use --force to replace)" % dest)
+        else:
+            if os.path.exists(dest):
+                _backup(dest, backup_root, cfg, log, dry_run)
+            log("write   %s" % dest)
+    if not dry_run:
+        if exists:
+            shutil.rmtree(dest_side, ignore_errors=True)
+        _write_private(dest_transcript, ("\n".join(lines) + "\n").encode("utf-8"))
+        for n in side_files:
+            _write_private(os.path.join(base, sid, n[len(side_prefix):]), members[n])
+        for n in mem_files:
+            dest = os.path.join(base, n)
+            if dest not in skipped:
+                _write_private(dest, members[n])
+        try:
+            os.chmod(base, 0o700)
+        except OSError:
+            pass
+    warn_versions(manifest, claude_version, log)
+    if manifest.get("git_branch"):
+        log("note    the session was on git branch '%s'. Make sure your repo has that branch and the same "
+            "commits (git pull) before resuming." % manifest["git_branch"])
+    log("")
+    if dry_run:
+        log("dry run: nothing was written.")
+    else:
+        log("Imported. Run:")
+    log("  cd %s && claude --resume %s" % (shell_quote(target), sid))
+    return {"session_id": sid, "folder": folder, "target": target}
+
+
+def warn_versions(manifest, installed, log):
+    exported = parse_version(manifest.get("claude_code_version"))
+    here = parse_version(installed)
+    if exported and here and here < exported:
+        log("warning: exported with Claude Code %s but this Mac has %s. Update Claude Code first; "
+            "older versions may not read newer transcripts." % (manifest["claude_code_version"], installed))
+    elif exported and not here:
+        log("note    could not read the installed Claude Code version; the bundle was made with %s." %
+            manifest["claude_code_version"])
+
+
+def shell_quote(text):
+    return text if re.match(r"^[A-Za-z0-9_@%+=:,./-]+$", text) else "'" + text.replace("'", "'\\''") + "'"
+
+
+# -------------------------------------------------------------------------- core: doctor
+
+
+def doctor_bundle(path):
+    try:
+        manifest, members = open_bundle(path)
+    except ToolError as exc:
+        return [str(exc)], []
+    return verify_bundle_data(manifest, members), []
+
+
+def doctor_session(cfg, directory, session_id, project_folder=None):
+    """Return (errors, warnings) for an imported session."""
+    errors, warnings = [], []
+    check_session_id(session_id)
+    target = os.path.realpath(directory)
+    try:
+        folder = resolve_folder(cfg, target, project_folder)
+    except ToolError as exc:
+        return [str(exc)], []
+    path = os.path.join(cfg, "projects", folder, session_id + ".jsonl")
+    if not os.path.isfile(path):
+        alt = None
+        try:
+            if not project_folder:
+                alt = encode_project_path(os.path.abspath(directory))
+        except ToolError:
+            alt = None
+        if alt and alt != folder and os.path.isfile(os.path.join(cfg, "projects", alt, session_id + ".jsonl")):
+            warnings.append("Session is stored under %s, which matches the unresolved path %s, but Claude "
+                            "Code may use %s. Re-import with the real path." % (alt, os.path.abspath(directory), folder))
+        else:
+            errors.append("Transcript not found: %s" % path)
+        return errors, warnings
+    with open(path, encoding="utf-8") as fh:
+        text = fh.read()
+    errors += check_jsonl(text, session_id)
+    facts = transcript_facts(path) if not errors else {"cwd": None}
+    cwd = facts.get("cwd")
+    if cwd and not (cwd == target or cwd.startswith(target.rstrip("/") + "/")):
+        errors.append("Transcript cwd %s is not under the project path %s. The session was not rewritten for "
+                      "this directory." % (cwd, target))
+    return errors, warnings
+
+
+# ---------------------------------------------------------------------------------- CLI
+
+
+def build_parser():
+    p = argparse.ArgumentParser(prog="claude-session-move",
+                                description="Move a Claude Code session to another Mac. No network. "
+                                            "Bundles contain full transcripts: treat them as secrets.")
+    p.add_argument("--version", action="version", version="claude-session-move " + TOOL_VERSION)
+    sub = p.add_subparsers(dest="command", required=True)
+
+    ls = sub.add_parser("list", help="list sessions of a directory")
+    ls.add_argument("--dir", default=".", help="project directory (default: current)")
+    ls.add_argument("--project-folder", help="exact folder name under projects/")
+
+    ex = sub.add_parser("export", help="write a bundle for one session")
+    ex.add_argument("session", nargs="?", help="session id or 'latest' (default: ask)")
+    ex.add_argument("--dir", default=".", help="project directory (default: current)")
+    ex.add_argument("-o", "--output", help="bundle path (default: ./<dir>-<id8>%s)" % BUNDLE_SUFFIX)
+    ex.add_argument("--memory", action="store_true", help="also bundle the project's memory/ folder")
+    ex.add_argument("--no-sidecar", action="store_true", help="leave out subagents/ and tool-results/")
+    ex.add_argument("--project-folder", help="exact folder name under projects/")
+    ex.add_argument("--force", action="store_true", help="replace an existing bundle file")
+    ex.add_argument("--dry-run", action="store_true")
+
+    im = sub.add_parser("import", help="install a bundle into a project directory")
+    im.add_argument("bundle")
+    im.add_argument("--dir", default=".", help="target project directory (default: current)")
+    im.add_argument("--project-folder", help="exact folder name under projects/")
+    im.add_argument("--force", action="store_true", help="overwrite an existing session (backs up first)")
+    im.add_argument("--dry-run", action="store_true")
+
+    for name in ("doctor", "verify"):
+        dr = sub.add_parser(name, help="check a bundle file or an imported session id")
+        dr.add_argument("target", help="a bundle file, or a session id")
+        dr.add_argument("--dir", default=".", help="project directory for a session id (default: current)")
+        dr.add_argument("--project-folder", help="exact folder name under projects/")
+
+    sub.add_parser("handoff-prompt", help="print text to paste into a session to save its open tasks")
+    return p
+
+
+def run(argv, env=None, stdin=None, stdout=None):
+    args = build_parser().parse_args(argv)
+    cfg = config_dir(env)
+    out = stdout or sys.stdout
+
+    def log(message=""):
+        print(message, file=out)
+
+    if args.command == "handoff-prompt":
+        log(HANDOFF_PROMPT)
+        return 0
+    if args.command == "list":
+        folder = resolve_folder(cfg, args.dir, args.project_folder)
+        rows = list_sessions(cfg, folder)
+        if not rows:
+            log("No sessions in %s" % os.path.join(cfg, "projects", folder))
+            return 0
+        print_session_table(rows, out)
+        return 0
+    if args.command == "export":
+        folder = resolve_folder(cfg, args.dir, args.project_folder)
+        rows = list_sessions(cfg, folder)
+        sid = pick_session(rows, args.session, stdin, out)
+        export_session(cfg, args.dir, sid, out=args.output, memory=args.memory, sidecar=not args.no_sidecar,
+                       dry_run=args.dry_run, project_folder=args.project_folder, force=args.force, log=log)
+        return 0
+    if args.command == "import":
+        import_bundle(cfg, args.bundle, args.dir, force=args.force, dry_run=args.dry_run,
+                      project_folder=args.project_folder, log=log,
+                      claude_version=installed_claude_version(env))
+        return 0
+    if args.command in ("doctor", "verify"):
+        if os.path.isfile(args.target):
+            errors, warnings = doctor_bundle(args.target)
+            what = "bundle " + args.target
+        else:
+            errors, warnings = doctor_session(cfg, args.dir, args.target, args.project_folder)
+            what = "session " + args.target
+        for w in warnings:
+            log("warning: " + w)
+        for e in errors:
+            log("error: " + e)
+        if errors:
+            log("%s: %d problem(s) found." % (what, len(errors)))
+            return 1
+        log("%s: OK" % what)
+        return 0
+    return 2
+
+
+def main():
+    try:
+        sys.exit(run(sys.argv[1:]))
+    except ToolError as exc:
+        print("error: %s" % exc, file=sys.stderr)
+        sys.exit(2)
+    except KeyboardInterrupt:
+        sys.exit(130)
+
+
+if __name__ == "__main__":
+    main()

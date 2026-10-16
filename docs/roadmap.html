@@ -1,0 +1,225 @@
+<title>Session Mover Roadmap</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Public+Sans:wght@400;500;700;800&display=swap">
+<style>
+/* Layout: summary band on top, then phase list (wide) beside a sticky decisions/open-items rail. */
+:root {
+  --bg: #f3f5f6;
+  --surface: #ffffff;
+  --fg: #14232b;
+  --muted: #55656d;
+  --line: #d5dde1;
+  --accent: #0b6e8a;
+  --accent-soft: #dcedf2;
+  --done: #1d7a46;
+  --doing: #b25e00;
+  --todo: #6b7b84;
+  --font-body: "Public Sans", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --font-mono: "IBM Plex Mono", ui-monospace, "SF Mono", Menlo, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #0f1a1f; --surface: #172830; --fg: #e4eef2; --muted: #93a8b1; --line: #28404a;
+    --accent: #5cc3df; --accent-soft: #19404c; --done: #5fcf8f; --doing: #f0a24a; --todo: #8aa0aa;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #0f1a1f; --surface: #172830; --fg: #e4eef2; --muted: #93a8b1; --line: #28404a;
+  --accent: #5cc3df; --accent-soft: #19404c; --done: #5fcf8f; --doing: #f0a24a; --todo: #8aa0aa;
+  color-scheme: dark;
+}
+* { box-sizing: border-box; }
+body {
+  background: var(--bg); color: var(--fg); font-family: var(--font-body); font-size: 15px; line-height: 1.5;
+  padding-block: 32px 56px;
+  padding-left: max(16px, env(safe-area-inset-left, 0px));
+  padding-right: max(16px, env(safe-area-inset-right, 0px));
+}
+.wrap { max-width: 1080px; margin: 0 auto; display: flex; flex-direction: column; gap: 24px; }
+h1 { font-size: clamp(26px, 4vw, 38px); line-height: 1.1; font-weight: 800; margin: 0; text-wrap: balance; letter-spacing: -0.01em; }
+h2 { font-size: 13px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); margin: 0 0 12px; }
+h3 { font-size: 17px; margin: 0; font-weight: 700; }
+code, .mono { font-family: var(--font-mono); font-size: 0.9em; }
+.sub { color: var(--muted); max-width: 62ch; margin: 8px 0 0; }
+.head { display: flex; flex-direction: column; gap: 16px; }
+.summary { display: flex; flex-wrap: wrap; gap: 12px 32px; align-items: center; }
+.bar { flex: 1 1 280px; min-width: 0; height: 10px; background: var(--line); border-radius: 5px; overflow: hidden; display: flex; }
+.bar span { display: block; height: 100%; }
+.bar .b-done { background: var(--done); }
+.bar .b-doing { background: var(--doing); }
+.counts { display: flex; gap: 20px; font-family: var(--font-mono); font-size: 13px; flex-wrap: wrap; }
+.counts b { font-weight: 500; color: var(--fg); }
+.main { display: grid; grid-template-columns: minmax(0, 1fr) 320px; gap: 24px; align-items: start; }
+@media (max-width: 860px) { .main { grid-template-columns: minmax(0, 1fr); } }
+.phases { display: flex; flex-direction: column; gap: 12px; }
+.phase { background: var(--surface); border: 1px solid var(--line); border-radius: 6px; padding: 16px; display: flex; flex-direction: column; gap: 10px; }
+.phase header { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+.pill { font-family: var(--font-mono); font-size: 12px; padding: 2px 8px; border-radius: 3px; border: 1px solid currentColor; white-space: nowrap; }
+.pill.done { color: var(--done); } .pill.doing { color: var(--doing); } .pill.todo { color: var(--todo); } .pill.later { color: var(--todo); border-style: dashed; }
+.goal { margin: 0; color: var(--muted); font-size: 14px; }
+.tasks { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
+.tasks li { display: grid; grid-template-columns: 18px minmax(0, 1fr); gap: 8px; align-items: start; overflow-wrap: anywhere; }
+.box { width: 16px; height: 16px; margin-top: 3px; border: 1.5px solid var(--todo); border-radius: 3px; position: relative; }
+.tasks li.done .box { background: var(--done); border-color: var(--done); }
+.tasks li.done .box::after { content: ""; position: absolute; left: 4px; top: 0px; width: 4px; height: 9px; border: solid var(--surface); border-width: 0 2px 2px 0; transform: rotate(45deg); }
+.tasks li.done span.t { color: var(--muted); }
+.rail { display: flex; flex-direction: column; gap: 16px; position: sticky; top: 16px; }
+@media (max-width: 860px) { .rail { position: static; } }
+.panel { background: var(--surface); border: 1px solid var(--line); border-radius: 6px; padding: 16px; }
+.panel ul { margin: 0; padding-left: 18px; display: flex; flex-direction: column; gap: 6px; font-size: 14px; }
+.panel.open { border-color: var(--accent); background: var(--accent-soft); }
+.stamp { font-family: var(--font-mono); font-size: 12px; color: var(--muted); }
+</style>
+
+<div class="wrap">
+  <div class="head">
+    <div>
+      <h1>Session Mover Roadmap</h1>
+      <p class="sub">Moving a Claude Code session from one Mac to another with <code>claude-session-move</code>: a single Python file, standard library only, no network.</p>
+    </div>
+    <div class="summary">
+      <div class="bar" id="bar" role="img" aria-label="Overall progress"></div>
+      <div class="counts" id="counts"></div>
+    </div>
+    <div class="stamp">Updated 2026-10-16 · built, awaiting review</div>
+  </div>
+
+  <div class="main">
+    <section>
+      <h2>Phases</h2>
+      <div class="phases" id="phases"></div>
+    </section>
+    <aside class="rail">
+      <div class="panel open">
+        <h2>Waiting on you</h2>
+        <ul id="waiting"></ul>
+      </div>
+      <div class="panel">
+        <h2>Decisions locked</h2>
+        <ul id="decisions"></ul>
+      </div>
+    </aside>
+  </div>
+</div>
+
+<script>
+// Edit this data to update the page. A task is [text, done]. A phase's status comes from its tasks unless "later" is set.
+var PHASES = [
+  { name: "0 · Design", goal: "Agree on behavior before writing code.", tasks: [
+    ["Read a real transcript and the project folder layout", true],
+    ["Check the official docs: CLAUDE_CONFIG_DIR, folder naming, what resume reads", true],
+    ["Settle the 18 design questions", true],
+    ["Confirm shared understanding, then start building", true],
+    ["Write GLOSSARY.md and ADRs for the decisions", true]
+  ]},
+  { name: "1 · Repo setup", goal: "A safe place to build. Transcripts must never be committed.", tasks: [
+    ["Default branch: master (saved to your global CLAUDE.md)", true],
+    ["Add .gitignore for *.claude-session.tar.gz and any test data", true],
+    ["Add LICENSE (MIT) and README with the security warning first", true],
+    ["Create GitHub issues for the phases below, labeled ready-for-agent", true]
+  ]},
+  { name: "2 · Core", goal: "Pure functions that return data. The CLI and a later GUI both sit on top.", tasks: [
+    ["Config dir: CLAUDE_CONFIG_DIR, else ~/.claude", true],
+    ["Folder name from a path: non-alphanumerics become -, stop on over 200 chars or non-ASCII", true],
+    ["List sessions: id, modified time, size, title from first real user message", true],
+    ["Resolve latest, pick by number, error without a TTY", true]
+  ]},
+  { name: "3 · Export", goal: "One .tar.gz with transcript, sidecar folder, optional memory, and a manifest.", tasks: [
+    ["Manifest: original path, session id, tool version, created time, sha256 per file", true],
+    ["Bundle the .jsonl and the <id>/ sidecar (subagents, tool-results); --no-sidecar", true],
+    ["--memory flag for the project's memory/ folder", true],
+    ["Print the secrets reminder to stderr", true]
+  ]},
+  { name: "4 · Import", goal: "Land the session where Claude Code will find it, without hurting anything already there.", tasks: [
+    ["Derive the target folder from the real path of the target directory", true],
+    ["Rewrite only the cwd field; leave message text and tool results alone", true],
+    ["Refuse an existing session id without --force; back up to <config>/session-move-backups/", true],
+    ["Memory merge: skip same-named files, overwrite with --force after a backup", true],
+    ["Reject tar entries with .. or absolute paths", true],
+    ["Create files as 0600 and folders as 0700", true],
+    ["Print the exact claude --resume <id> command", true]
+  ]},
+  { name: "5 · doctor / verify", goal: "Say clearly what is wrong with a bundle or an imported session.", tasks: [
+    ["Bundle checks: archive opens, manifest present, checksums match", true],
+    ["Session checks: valid JSONL, session id present, cwd matches, folder name matches", true],
+    ["Warn when the folder matches only the unresolved form of the path", true],
+    ["Exit code 1 on any error, one line per problem", true]
+  ]},
+  { name: "6 · Dry run and handoff", goal: "Preview everything, and cover what the bundle cannot carry.", tasks: [
+    ["--dry-run for export and import: print reads, writes, rewrites; change nothing", true],
+    ["Task-list warning on export, with a handoff-prompt command that prints text to paste into the session", true]
+  ]},
+  { name: "7 · Tests", goal: "unittest with a fake config dir in a temp directory. Your real ~/.claude is never touched.", tasks: [
+    ["Export, then import to a different path", true],
+    ["Path with spaces", true],
+    ["Collision without --force", true],
+    ["Corrupt bundle", true],
+    ["Malicious tar entry", true]
+  ]},
+  { name: "8 · Docs and round trip", goal: "Show it works, and say plainly what was and was not proven.", tasks: [
+    ["README: install, one export and one import example, secrets warning, what is not carried", true],
+    ["Round trip: export the squad-creator example, import into /tmp/restore-test/some-repo", true],
+    ["Show test output and the doctor result. Resume is file-verified, not run", true]
+  ]},
+  { name: "9 · Later", later: true, goal: "Out of scope for now.", tasks: [
+    ["GUI wrapper over the core functions", false],
+    ["Optional encryption of the bundle", false]
+  ]}
+];
+var WAITING = [
+  "Review the code and the round-trip output.",
+  
+  "Run the printed claude --resume on a real second Mac; resume is file-verified only."
+];
+var DECISIONS = [
+  "CLI first, GUI later; core is plain functions",
+  "Single Python 3.9+ file, standard library only",
+  "Bundle: tar.gz plus manifest with sha256",
+  "Sidecar folder included; memory only with --memory",
+  "Rewrite cwd only",
+  "No redaction, no encryption; README warns",
+  "No API calls; resume is file-verified",
+  "Not bundled: tasks, file-history, history, session-env",
+  "Backups outside projects/, files 0600",
+  "Target directory must exist; realpath is used",
+  "Over 200 chars or non-ASCII: use --project-folder"
+];
+
+function el(tag, cls, text) { var e = document.createElement(tag); if (cls) e.className = cls; if (text != null) e.textContent = text; return e; }
+
+var total = 0, done = 0, doing = 0, host = document.getElementById("phases");
+PHASES.forEach(function (p) {
+  var d = p.tasks.filter(function (t) { return t[1]; }).length;
+  var status = p.later ? "later" : d === p.tasks.length ? "done" : d > 0 ? "doing" : "todo";
+  if (!p.later) { total += p.tasks.length; done += d; }
+  var label = { done: "done", doing: d + "/" + p.tasks.length, todo: "not started", later: "later" }[status];
+  var card = el("article", "phase");
+  var head = el("header");
+  head.appendChild(el("h3", null, p.name));
+  head.appendChild(el("span", "pill " + status, label));
+  card.appendChild(head);
+  card.appendChild(el("p", "goal", p.goal));
+  var ul = el("ul", "tasks");
+  p.tasks.forEach(function (t) {
+    var li = el("li", t[1] ? "done" : "");
+    li.appendChild(el("span", "box"));
+    li.appendChild(el("span", "t", t[0]));
+    ul.appendChild(li);
+  });
+  card.appendChild(ul);
+  host.appendChild(card);
+});
+// "In progress" band: tasks of the first phase that is started but not finished.
+var firstOpen = PHASES.filter(function (p) { return !p.later && p.tasks.some(function (t) { return !t[1]; }); })[0];
+if (firstOpen) doing = firstOpen.tasks.filter(function (t) { return !t[1]; }).length ? 1 : 0;
+var pct = total ? Math.round(done / total * 100) : 0;
+var bar = document.getElementById("bar");
+var s1 = el("span", "b-done"); s1.style.width = pct + "%"; bar.appendChild(s1);
+var counts = document.getElementById("counts");
+[["done", done], ["left", total - done], ["progress", pct + "%"]].forEach(function (c) {
+  var s = el("span"); s.appendChild(el("b", null, String(c[1]))); s.appendChild(document.createTextNode(" " + c[0])); counts.appendChild(s);
+});
+WAITING.forEach(function (t) { document.getElementById("waiting").appendChild(el("li", null, t)); });
+DECISIONS.forEach(function (t) { document.getElementById("decisions").appendChild(el("li", null, t)); });
+</script>
