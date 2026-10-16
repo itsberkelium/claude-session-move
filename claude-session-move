@@ -590,6 +590,92 @@ def doctor_session(cfg, directory, session_id, project_folder=None):
     return errors, warnings
 
 
+# ------------------------------------------------------------------ core: cleanup, install
+
+
+def plan_cleanup(cfg, directory, session_id, project_folder=None, backups=False):
+    """Return the list of existing paths a cleanup would delete (nothing is deleted here)."""
+    check_session_id(session_id)
+    folder = resolve_folder(cfg, directory, project_folder)
+    base = os.path.join(cfg, "projects", folder)
+    paths = [p for p in (os.path.join(base, session_id + ".jsonl"), os.path.join(base, session_id))
+             if os.path.exists(p)]
+    if backups:
+        root = os.path.join(cfg, "session-move-backups")
+        if os.path.isdir(root):
+            for stamp in sorted(os.listdir(root)):
+                for name in (session_id + ".jsonl", session_id):
+                    p = os.path.join(root, stamp, "projects", folder, name)
+                    if os.path.exists(p):
+                        paths.append(p)
+    return paths
+
+
+def _remove(path):
+    if os.path.isdir(path) and not os.path.islink(path):
+        shutil.rmtree(path)
+    else:
+        os.unlink(path)
+
+
+def _prune_empty(path, stop):
+    """Remove empty directories upward from `path`, never `stop` itself or anything above it."""
+    path, stop = os.path.abspath(path), os.path.abspath(stop)
+    while path.startswith(stop + os.sep):
+        try:
+            os.rmdir(path)
+        except OSError:
+            return
+        path = os.path.dirname(path)
+
+
+def cleanup_session(cfg, directory, session_id, project_folder=None, backups=False, dry_run=False, log=print):
+    """Delete an imported session (transcript + sidecar) and optionally its backups."""
+    paths = plan_cleanup(cfg, directory, session_id, project_folder, backups)
+    if not paths:
+        log("Nothing to remove for session %s." % session_id)
+        return []
+    for p in paths:
+        log("%s %s" % ("would remove" if dry_run else "remove      ", p))
+    if dry_run:
+        log("dry run: nothing was removed.")
+        return paths
+    for p in paths:
+        _remove(p)
+        _prune_empty(os.path.dirname(p), os.path.join(cfg, "session-move-backups"))
+    base = os.path.join(cfg, "projects", resolve_folder(cfg, directory, project_folder))
+    if os.path.isdir(base) and not os.listdir(base):
+        os.rmdir(base)
+    return paths
+
+
+def install_script(prefix=None, force=False, dry_run=False, log=print, env=None, source=None):
+    """Copy this script to <prefix>/claude-session-move (default ~/.local/bin)."""
+    env = os.environ if env is None else env
+    source = os.path.realpath(source or __file__)
+    prefix = os.path.abspath(os.path.expanduser(prefix or "~/.local/bin"))
+    dest = os.path.join(prefix, "claude-session-move")
+    if os.path.realpath(dest) == source:
+        log("Already installed at %s" % dest)
+        return dest
+    if os.path.exists(dest) and not force:
+        with open(dest, "r", encoding="utf-8", errors="replace") as fh:
+            head = fh.read(300)
+        if "claude-session-move:" not in head:
+            raise ToolError("%s exists and does not look like this tool. Use --force to replace it." % dest)
+    log("%s %s -> %s" % ("would copy" if dry_run else "copy      ", source, dest))
+    if not dry_run:
+        os.makedirs(prefix, exist_ok=True)
+        tmp = dest + ".tmp"
+        shutil.copyfile(source, tmp)
+        os.chmod(tmp, 0o755)
+        os.replace(tmp, dest)
+    if prefix not in (env.get("PATH") or "").split(os.pathsep):
+        log("note    %s is not on your PATH. Add it with:" % prefix)
+        log("  echo 'export PATH=\"%s:$PATH\"' >> ~/.zshrc && source ~/.zshrc" % prefix)
+    return dest
+
+
 # ---------------------------------------------------------------------------------- CLI
 
 
@@ -627,6 +713,19 @@ def build_parser():
         dr.add_argument("--dir", default=".", help="project directory for a session id (default: current)")
         dr.add_argument("--project-folder", help="exact folder name under projects/")
 
+    cl = sub.add_parser("cleanup", help="delete an imported session (and optionally its backups)")
+    cl.add_argument("session", help="session id")
+    cl.add_argument("--dir", default=".", help="project directory (default: current)")
+    cl.add_argument("--project-folder", help="exact folder name under projects/")
+    cl.add_argument("--backups", action="store_true", help="also delete this session's import backups")
+    cl.add_argument("--yes", action="store_true", help="do not ask for confirmation")
+    cl.add_argument("--dry-run", action="store_true")
+
+    ins = sub.add_parser("install", help="copy this script onto your PATH (default ~/.local/bin)")
+    ins.add_argument("--prefix", help="install directory (default: ~/.local/bin)")
+    ins.add_argument("--force", action="store_true")
+    ins.add_argument("--dry-run", action="store_true")
+
     sub.add_parser("handoff-prompt", help="print text to paste into a session to save its open tasks")
     return p
 
@@ -641,6 +740,21 @@ def run(argv, env=None, stdin=None, stdout=None):
 
     if args.command == "handoff-prompt":
         log(HANDOFF_PROMPT)
+        return 0
+    if args.command == "cleanup":
+        paths = plan_cleanup(cfg, args.dir, args.session, args.project_folder, args.backups)
+        if paths and not (args.dry_run or args.yes):
+            stdin = stdin or sys.stdin
+            if not (stdin.isatty() and out.isatty()):
+                raise ToolError("Cleanup deletes files. Re-run with --yes (or --dry-run to preview).")
+            for p in paths:
+                log("will remove %s" % p)
+            if input("Type 'yes' to delete: ").strip().lower() != "yes":
+                raise ToolError("Cancelled. Nothing was removed.")
+        cleanup_session(cfg, args.dir, args.session, args.project_folder, args.backups, args.dry_run, log)
+        return 0
+    if args.command == "install":
+        install_script(args.prefix, args.force, args.dry_run, log, env)
         return 0
     if args.command == "list":
         folder = resolve_folder(cfg, args.dir, args.project_folder)

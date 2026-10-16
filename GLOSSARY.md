@@ -19,3 +19,5 @@
 **Handoff prompt**: text the user pastes into a running session to make it write down state the bundle cannot carry (open tasks, next steps).
 
 **Not carried**: state outside `projects/<folder>`: tasks, file-history, `history.jsonl`, session-env, MCP servers, permissions, hooks, auth, and the repo's code itself.
+
+**Cleanup**: deleting an imported session's transcript and sidecar (and optionally its backups) from a project folder. Never touches `memory/`.

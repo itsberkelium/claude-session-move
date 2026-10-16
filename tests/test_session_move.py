@@ -350,5 +350,91 @@ class DoctorAndCliTests(Base):
         self.assertEqual(csm.run(["doctor", out], env=env, stdout=io.StringIO()), 1)
 
 
+class CleanupTests(Base):
+    def setup_import(self, force_twice=False):
+        src = self.mkdir("a")
+        make_session(self.cfg, src, old=True)
+        bundle = self.export(src)
+        self.dst_cfg = os.path.join(self.root, "c2")
+        self.dst = self.mkdir("b")
+        csm.import_bundle(self.dst_cfg, bundle, self.dst, log=self.log)
+        if force_twice:
+            csm.import_bundle(self.dst_cfg, bundle, self.dst, force=True, log=self.log)
+        return src
+
+    def test_dry_run_and_removal(self):
+        self.setup_import()
+        folder = os.path.join(self.dst_cfg, "projects", csm.encode_project_path(self.dst))
+        csm.cleanup_session(self.dst_cfg, self.dst, SID, dry_run=True, log=self.log)
+        self.assertTrue(os.path.isfile(os.path.join(folder, SID + ".jsonl")))
+        removed = csm.cleanup_session(self.dst_cfg, self.dst, SID, log=self.log)
+        self.assertEqual(len(removed), 2)  # transcript + sidecar
+        self.assertFalse(os.path.exists(folder))  # empty project folder pruned
+
+    def test_only_target_session_and_original_untouched(self):
+        src = self.setup_import()
+        other = os.path.join(self.dst_cfg, "projects", csm.encode_project_path(self.dst), "other.jsonl")
+        with open(other, "w") as fh:
+            fh.write("{}\n")
+        csm.cleanup_session(self.dst_cfg, self.dst, SID, log=self.log)
+        self.assertTrue(os.path.isfile(other))
+        orig = os.path.join(self.cfg, "projects", csm.encode_project_path(src), SID + ".jsonl")
+        self.assertTrue(os.path.isfile(orig))
+
+    def test_backups_kept_without_flag(self):
+        self.setup_import(force_twice=True)
+        csm.cleanup_session(self.dst_cfg, self.dst, SID, log=self.log)
+        self.assertTrue(os.listdir(os.path.join(self.dst_cfg, "session-move-backups")))
+
+    def test_backups_removed_with_flag(self):
+        self.setup_import(force_twice=True)
+        csm.cleanup_session(self.dst_cfg, self.dst, SID, backups=True, log=self.log)
+        root = os.path.join(self.dst_cfg, "session-move-backups")
+        self.assertTrue(os.path.isdir(root))
+        self.assertEqual(os.listdir(root), [])
+
+    def test_cli_needs_yes_without_terminal(self):
+        self.setup_import()
+        env = {"CLAUDE_CONFIG_DIR": self.dst_cfg}
+        with self.assertRaises(csm.ToolError):
+            csm.run(["cleanup", SID, "--dir", self.dst], env=env, stdin=io.StringIO(), stdout=io.StringIO())
+        self.assertEqual(csm.run(["cleanup", SID, "--dir", self.dst, "--yes"], env=env, stdout=io.StringIO()), 0)
+
+    def test_session_id_is_validated(self):
+        with self.assertRaises(csm.ToolError):
+            csm.plan_cleanup(self.cfg, self.root, "../x")
+
+
+class InstallTests(Base):
+    def test_install_copies_executable_and_hints_path(self):
+        prefix = os.path.join(self.root, "bin")
+        dest = csm.install_script(prefix, log=self.log, env={"PATH": "/usr/bin"})
+        self.assertEqual(dest, os.path.join(prefix, "claude-session-move"))
+        self.assertTrue(os.access(dest, os.X_OK))
+        self.assertIn("not on your PATH", "\n".join(self.msgs))
+
+    def test_no_hint_when_on_path_and_dry_run_writes_nothing(self):
+        prefix = os.path.join(self.root, "bin")
+        csm.install_script(prefix, dry_run=True, log=self.log, env={"PATH": prefix})
+        self.assertFalse(os.path.exists(prefix))
+        self.assertNotIn("PATH", "\n".join(self.msgs))
+
+    def test_upgrade_ours_but_refuse_foreign_file(self):
+        prefix = self.mkdir("bin")
+        dest = os.path.join(prefix, "claude-session-move")
+        with open(dest, "w") as fh:
+            fh.write("#!/bin/sh\necho not ours\n")
+        with self.assertRaises(csm.ToolError):
+            csm.install_script(prefix, log=self.log, env={})
+        csm.install_script(prefix, force=True, log=self.log, env={})
+        csm.install_script(prefix, log=self.log, env={})  # now ours: plain upgrade
+        self.assertIn("claude-session-move:", read(dest)[:300])
+
+    def test_already_installed(self):
+        src = os.path.join(HERE, "..", "claude-session-move")
+        csm.install_script(os.path.dirname(os.path.abspath(src)), log=self.log, env={})
+        self.assertIn("Already installed", "\n".join(self.msgs))
+
+
 if __name__ == "__main__":
     unittest.main()

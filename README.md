@@ -9,8 +9,10 @@ Move a Claude Code terminal session from one Mac to another. Export on one machi
 One Python 3.9+ file, standard library only. Copy it onto your PATH:
 
 ```sh
-cp claude-session-move ~/.local/bin/ && chmod +x ~/.local/bin/claude-session-move
+python3 claude-session-move install
 ```
+
+This copies the script to `~/.local/bin` (change it with `--prefix DIR`) and tells you the one line to add to `~/.zshrc` if that folder is not on your PATH. It never edits your shell files. Running `install` again upgrades the installed copy.
 
 ## Use
 
@@ -28,7 +30,9 @@ claude-session-move import ~/Desktop/mysession.claude-session.tar.gz
 
 It prints the exact `cd ... && claude --resume <id>` command to run.
 
-Other commands: `list` (sessions of a directory), `doctor <bundle|session-id>` (alias `verify`), `handoff-prompt`.
+Other commands: `list` (sessions of a directory), `doctor <bundle|session-id>` (alias `verify`), `handoff-prompt`, `cleanup <session-id>`, `install`.
+
+`cleanup <session-id> [--dir DIR] [--backups]` deletes an imported session (transcript and its `<id>/` folder) from the project folder of `DIR`, and with `--backups` its import backups too. It asks first, needs `--yes` without a terminal, and `--dry-run` previews. It cannot tell an imported session from an original one, so check the listed paths before you confirm.
 Flags: `--dry-run` on export and import (changes nothing), `--memory` (also bundle `memory/`), `--no-sidecar`, `--force`, `--dir`, `--project-folder`.
 Run `claude-session-move export` with no session in a terminal to pick from a list.
 
